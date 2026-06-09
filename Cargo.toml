@@ -1,0 +1,30 @@
+[package]
+name = "nocturne"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy = { version = "0.17", default-features = false, features = [
+    "bevy_winit",
+    "x11",
+    "bevy_core_pipeline",
+    "bevy_sprite",
+    "bevy_text",
+    "default_font",
+    "bevy_state",
+    "multi_threaded",
+    "bevy_asset",
+    "bevy_render",
+    "bevy_window",
+    "bevy_color",
+    "bevy_log",
+    "std",
+    "async_executor",
+] }
+
+# Fast iteration: light opt for our code, full opt for Bevy itself
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
