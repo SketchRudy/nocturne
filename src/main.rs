@@ -198,6 +198,18 @@ struct StatsHud;
 #[derive(Component)]
 struct GameOverText;
 
+/// Spinning halo bars orbiting the player.
+#[derive(Component)]
+struct Halo;
+
+/// Arena border bars that breathe.
+#[derive(Component)]
+struct PulseBorder;
+
+/// Camera trauma: builds on hits/kills, decays fast, squared into shake offset.
+#[derive(Resource, Default)]
+struct Shake(f32);
+
 #[derive(Component)]
 struct Projectile {
     velocity: Vec2,
@@ -252,6 +264,7 @@ fn main() {
         .insert_resource(EnemySpawner(Timer::from_seconds(1.4, TimerMode::Repeating)))
         .init_resource::<Armory>()
         .init_resource::<GameStats>()
+        .init_resource::<Shake>()
         .init_state::<Phase>()
         .add_systems(Startup, setup)
         .add_systems(
@@ -269,6 +282,7 @@ fn main() {
             )
                 .run_if(in_state(Phase::Playing)),
         )
+        .add_systems(Update, (spin_halo, pulse_border, apply_shake))
         .add_systems(OnEnter(Phase::GameOver), show_game_over)
         .add_systems(Update, restart.run_if(in_state(Phase::GameOver)))
         .run();
@@ -312,16 +326,38 @@ fn setup(mut commands: Commands) {
         (Vec2::new(t, ARENA_HALF.y * 2.0 + t), Vec2::new(-ARENA_HALF.x, 0.0)),
     ] {
         commands.spawn((
+            PulseBorder,
             Sprite::from_color(BORDER, size),
             Transform::from_translation(pos.extend(-0.5)),
         ));
     }
 
-    commands.spawn((
-        Player { hp: 3, invuln: 0.0 },
-        Sprite::from_color(CRIMSON, Vec2::splat(26.0)),
-        Transform::from_xyz(0.0, 0.0, 1.0),
-    ));
+    // Player: crimson diamond with a counter-spinning gold halo.
+    commands
+        .spawn((
+            Player { hp: 3, invuln: 0.0 },
+            Sprite::from_color(CRIMSON, Vec2::splat(26.0)),
+            Transform::from_xyz(0.0, 0.0, 1.0)
+                .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_4)),
+        ))
+        .with_children(|parent| {
+            parent
+                .spawn((Halo, Transform::default(), Visibility::default()))
+                .with_children(|halo| {
+                    let r = 26.0;
+                    for (size, pos) in [
+                        (Vec2::new(r * 1.4, 2.0), Vec2::new(0.0, r)),
+                        (Vec2::new(r * 1.4, 2.0), Vec2::new(0.0, -r)),
+                        (Vec2::new(2.0, r * 1.4), Vec2::new(r, 0.0)),
+                        (Vec2::new(2.0, r * 1.4), Vec2::new(-r, 0.0)),
+                    ] {
+                        halo.spawn((
+                            Sprite::from_color(GOLD.with_alpha(0.7), size),
+                            Transform::from_translation(pos.extend(-0.1)),
+                        ));
+                    }
+                });
+        });
 
     commands.spawn((
         WeaponHud,
@@ -341,6 +377,39 @@ fn setup(mut commands: Commands) {
 }
 
 // ---------------------------------------------------------------- systems
+
+fn spin_halo(time: Res<Time>, mut halos: Query<&mut Transform, With<Halo>>) {
+    for mut tf in &mut halos {
+        tf.rotate_z(-1.1 * time.delta_secs());
+    }
+}
+
+fn pulse_border(time: Res<Time>, mut borders: Query<&mut Sprite, With<PulseBorder>>) {
+    let breathe = 0.75 + 0.25 * (time.elapsed_secs() * 1.7).sin();
+    for mut sprite in &mut borders {
+        let c = BORDER.to_linear();
+        sprite.color = Color::linear_rgb(c.red * breathe, c.green * breathe, c.blue * breathe);
+    }
+}
+
+fn apply_shake(
+    time: Res<Time>,
+    mut shake: ResMut<Shake>,
+    mut camera: Query<&mut Transform, With<Camera2d>>,
+) {
+    let Ok(mut tf) = camera.single_mut() else {
+        return;
+    };
+    shake.0 = (shake.0 - 2.2 * time.delta_secs()).max(0.0);
+    let amp = shake.0 * shake.0 * 14.0;
+    if amp < 0.01 {
+        tf.translation = Vec3::new(0.0, 0.0, tf.translation.z);
+        return;
+    }
+    let mut rng = rand::thread_rng();
+    tf.translation.x = rng.gen_range(-amp..amp);
+    tf.translation.y = rng.gen_range(-amp..amp);
+}
 
 fn move_player(
     keys: Res<ButtonInput<KeyCode>>,
@@ -388,6 +457,7 @@ fn fire_weapon(
     time: Res<Time>,
     mut cooldown: ResMut<FireCooldown>,
     mut armory: ResMut<Armory>,
+    mut shake: ResMut<Shake>,
     windows: Query<&Window>,
     camera: Query<(&Camera, &GlobalTransform)>,
     player: Query<&Transform, With<Player>>,
@@ -438,6 +508,10 @@ fn fire_weapon(
                 .with_rotation(Quat::from_rotation_z(angle)),
         ));
     }
+
+    // Muzzle flash + a tiny recoil kick.
+    spawn_burst(&mut commands, origin + aim * 22.0, stats.color, 3, 110.0);
+    shake.0 = (shake.0 + 0.05).min(1.0);
 
     // One trigger pull = one round, even for multi-pellet weapons.
     let rotated = armory.spend();
@@ -631,6 +705,7 @@ fn chase_player(
 fn projectile_hits(
     mut commands: Commands,
     mut stats: ResMut<GameStats>,
+    mut shake: ResMut<Shake>,
     mut projectiles: Query<(Entity, &Transform, &mut Projectile)>,
     mut enemies: Query<(Entity, &Transform, &mut Enemy)>,
 ) {
@@ -652,6 +727,7 @@ fn projectile_hits(
                 if enemy.hp <= 0 {
                     commands.entity(enemy_entity).despawn();
                     stats.kills += 1;
+                    shake.0 = (shake.0 + 0.16).min(1.0);
                     spawn_burst(&mut commands, hit_at, HUSK, 14, 260.0);
                     info!("husk down");
                 } else {
@@ -675,6 +751,7 @@ fn projectile_hits(
 fn contact_damage(
     mut commands: Commands,
     time: Res<Time>,
+    mut shake: ResMut<Shake>,
     mut next_phase: ResMut<NextState<Phase>>,
     mut player: Query<(&mut Player, &Transform, &mut Sprite)>,
     enemies: Query<&Transform, With<Enemy>>,
@@ -699,6 +776,7 @@ fn contact_damage(
         if pos.distance(enemy_tf.translation.truncate()) < HUSK_SIZE * 0.5 + 13.0 {
             player.hp -= 1;
             player.invuln = 1.0;
+            shake.0 = (shake.0 + 0.5).min(1.0);
             spawn_burst(&mut commands, pos, CRIMSON, 20, 320.0);
             info!("player hit, hp={}", player.hp);
             if player.hp <= 0 {
