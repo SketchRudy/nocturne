@@ -3,6 +3,7 @@
 //! You don't pick. You plan.
 
 use bevy::prelude::*;
+use rand::Rng;
 
 // Crimson Elite palette
 const BG: Color = Color::srgb(0.04, 0.03, 0.04); // warm black
@@ -25,6 +26,18 @@ struct Projectile {
 #[derive(Resource)]
 struct FireCooldown(Timer);
 
+const HUSK: Color = Color::srgb(0.61, 0.57, 0.72); // pale moonlit gray-violet
+const HUSK_SIZE: f32 = 22.0;
+const HUSK_SPEED: f32 = 110.0;
+
+#[derive(Component)]
+struct Enemy {
+    hp: i32,
+}
+
+#[derive(Resource)]
+struct EnemySpawner(Timer);
+
 fn main() {
     App::new()
         .insert_resource(ClearColor(BG))
@@ -37,8 +50,19 @@ fn main() {
             ..default()
         }))
         .insert_resource(FireCooldown(Timer::from_seconds(0.18, TimerMode::Once)))
+        .insert_resource(EnemySpawner(Timer::from_seconds(1.4, TimerMode::Repeating)))
         .add_systems(Startup, setup)
-        .add_systems(Update, (move_player, fire_weapon, move_projectiles))
+        .add_systems(
+            Update,
+            (
+                move_player,
+                fire_weapon,
+                move_projectiles,
+                spawn_enemies,
+                chase_player,
+                projectile_hits,
+            ),
+        )
         .run();
 }
 
@@ -128,6 +152,70 @@ fn fire_weapon(
             .with_rotation(Quat::from_rotation_z(dir.y.atan2(dir.x))),
     ));
     cooldown.0.reset();
+}
+
+fn spawn_enemies(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut spawner: ResMut<EnemySpawner>,
+) {
+    spawner.0.tick(time.delta());
+    if !spawner.0.just_finished() {
+        return;
+    }
+    let mut rng = rand::thread_rng();
+    // Spawn on a random edge of the arena
+    let pos = match rng.gen_range(0..4) {
+        0 => Vec2::new(rng.gen_range(-ARENA_HALF.x..ARENA_HALF.x), ARENA_HALF.y),
+        1 => Vec2::new(rng.gen_range(-ARENA_HALF.x..ARENA_HALF.x), -ARENA_HALF.y),
+        2 => Vec2::new(ARENA_HALF.x, rng.gen_range(-ARENA_HALF.y..ARENA_HALF.y)),
+        _ => Vec2::new(-ARENA_HALF.x, rng.gen_range(-ARENA_HALF.y..ARENA_HALF.y)),
+    };
+    commands.spawn((
+        Enemy { hp: 2 },
+        Sprite::from_color(HUSK, Vec2::splat(HUSK_SIZE)),
+        Transform::from_translation(pos.extend(0.8)),
+    ));
+}
+
+fn chase_player(
+    time: Res<Time>,
+    player: Query<&Transform, With<Player>>,
+    mut enemies: Query<&mut Transform, (With<Enemy>, Without<Player>)>,
+) {
+    let Ok(player_tf) = player.single() else {
+        return;
+    };
+    let target = player_tf.translation.truncate();
+    for mut tf in &mut enemies {
+        let pos = tf.translation.truncate();
+        let dir = (target - pos).normalize_or_zero();
+        tf.translation += (dir * HUSK_SPEED * time.delta_secs()).extend(0.0);
+    }
+}
+
+fn projectile_hits(
+    mut commands: Commands,
+    projectiles: Query<(Entity, &Transform), With<Projectile>>,
+    mut enemies: Query<(Entity, &Transform, &mut Enemy)>,
+) {
+    for (proj_entity, proj_tf) in &projectiles {
+        for (enemy_entity, enemy_tf, mut enemy) in &mut enemies {
+            let dist = proj_tf
+                .translation
+                .truncate()
+                .distance(enemy_tf.translation.truncate());
+            if dist < HUSK_SIZE * 0.5 + 7.0 {
+                commands.entity(proj_entity).despawn();
+                enemy.hp -= 1;
+                if enemy.hp <= 0 {
+                    commands.entity(enemy_entity).despawn();
+                    info!("husk down");
+                }
+                break;
+            }
+        }
+    }
 }
 
 fn move_projectiles(
