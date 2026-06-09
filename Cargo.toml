@@ -8,6 +8,7 @@ bevy = { version = "0.17", default-features = false, features = [
     "bevy_winit",
     "x11",
     "bevy_core_pipeline",
+    "bevy_post_process",
     "bevy_sprite",
     "bevy_sprite_render",
     "bevy_text",

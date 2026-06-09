@@ -4,14 +4,19 @@
 
 use std::collections::VecDeque;
 
+use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::post_process::bloom::Bloom;
+use bevy::render::view::Hdr;
 use bevy::prelude::*;
 use rand::Rng;
 
-// Crimson Elite palette
-const BG: Color = Color::srgb(0.04, 0.03, 0.04); // warm black
-const CRIMSON: Color = Color::srgb(0.86, 0.08, 0.24);
-const GOLD: Color = Color::srgb(0.95, 0.78, 0.25);
-const HUSK: Color = Color::srgb(0.61, 0.57, 0.72); // pale moonlit gray-violet
+// Crimson Elite palette. HDR values (>1.0) so bright things bloom into light.
+const BG: Color = Color::srgb(0.025, 0.02, 0.03); // warm black
+const CRIMSON: Color = Color::linear_rgb(5.0, 0.35, 0.9);
+const GOLD: Color = Color::linear_rgb(6.0, 4.0, 1.2);
+const HUSK: Color = Color::linear_rgb(1.3, 1.0, 2.4); // moonlit violet, gently glowing
+const GRID: Color = Color::srgb(0.10, 0.07, 0.13);
+const BORDER: Color = Color::linear_rgb(2.2, 0.5, 1.0);
 
 const PLAYER_SPEED: f32 = 320.0;
 const ARENA_HALF: Vec2 = Vec2::new(610.0, 330.0);
@@ -75,7 +80,7 @@ impl WeaponKind {
                 slow: false,
                 pellets: 1,
                 spread: 0.0,
-                color: Color::srgb(0.75, 0.9, 1.0), // pale ice
+                color: Color::linear_rgb(2.2, 4.5, 7.0), // pale ice
                 size: Vec2::new(34.0, 4.0),
             },
             WeaponKind::Scatter => WeaponStats {
@@ -90,7 +95,7 @@ impl WeaponKind {
                 slow: false,
                 pellets: 5,
                 spread: 0.55,
-                color: Color::srgb(0.95, 0.45, 0.18), // ember orange
+                color: Color::linear_rgb(7.0, 2.0, 0.4), // ember orange
                 size: Vec2::new(9.0, 5.0),
             },
             WeaponKind::Graven => WeaponStats {
@@ -105,7 +110,7 @@ impl WeaponKind {
                 slow: true,
                 pellets: 1,
                 spread: 0.0,
-                color: Color::srgb(0.55, 0.3, 0.85), // deep violet
+                color: Color::linear_rgb(2.5, 1.0, 7.0), // deep violet
                 size: Vec2::splat(10.0),
             },
             WeaponKind::Crescent => WeaponStats {
@@ -120,7 +125,7 @@ impl WeaponKind {
                 slow: false,
                 pellets: 1,
                 spread: 0.0,
-                color: Color::srgb(0.92, 0.92, 0.98), // moon silver
+                color: Color::linear_rgb(5.5, 5.5, 6.5), // moon silver
                 size: Vec2::new(18.0, 8.0),
             },
         }
@@ -209,6 +214,16 @@ struct Projectile {
 struct Enemy {
     hp: i32,
     slow_left: f32,
+    flash: f32,
+}
+
+/// Short-lived fading sprite — projectile trails and burst debris.
+#[derive(Component)]
+struct Particle {
+    velocity: Vec2,
+    ttl: f32,
+    life: f32,
+    spin: f32,
 }
 
 #[derive(Component)]
@@ -249,6 +264,7 @@ fn main() {
                 chase_player,
                 projectile_hits,
                 contact_damage,
+                update_particles,
                 update_hud,
             )
                 .run_if(in_state(Phase::Playing)),
@@ -259,7 +275,47 @@ fn main() {
 }
 
 fn setup(mut commands: Commands) {
-    commands.spawn(Camera2d);
+    commands.spawn((
+        Camera2d,
+        Hdr,
+        Tonemapping::AcesFitted,
+        Bloom {
+            intensity: 0.28,
+            ..Bloom::NATURAL
+        },
+    ));
+
+    // Arena floor: a faint grid so the space reads as a place, not a void.
+    let step = 61.0;
+    let mut x = -ARENA_HALF.x;
+    while x <= ARENA_HALF.x + 0.1 {
+        commands.spawn((
+            Sprite::from_color(GRID, Vec2::new(1.5, ARENA_HALF.y * 2.0)),
+            Transform::from_xyz(x, 0.0, -1.0),
+        ));
+        x += step;
+    }
+    let mut y = -ARENA_HALF.y;
+    while y <= ARENA_HALF.y + 0.1 {
+        commands.spawn((
+            Sprite::from_color(GRID, Vec2::new(ARENA_HALF.x * 2.0, 1.5)),
+            Transform::from_xyz(0.0, y, -1.0),
+        ));
+        y += step;
+    }
+    // Glowing arena border (four bars).
+    let t = 4.0;
+    for (size, pos) in [
+        (Vec2::new(ARENA_HALF.x * 2.0 + t, t), Vec2::new(0.0, ARENA_HALF.y)),
+        (Vec2::new(ARENA_HALF.x * 2.0 + t, t), Vec2::new(0.0, -ARENA_HALF.y)),
+        (Vec2::new(t, ARENA_HALF.y * 2.0 + t), Vec2::new(ARENA_HALF.x, 0.0)),
+        (Vec2::new(t, ARENA_HALF.y * 2.0 + t), Vec2::new(-ARENA_HALF.x, 0.0)),
+    ] {
+        commands.spawn((
+            Sprite::from_color(BORDER, size),
+            Transform::from_translation(pos.extend(-0.5)),
+        ));
+    }
 
     commands.spawn((
         Player { hp: 3, invuln: 0.0 },
@@ -437,6 +493,31 @@ fn move_projectiles(
         transform.translation = next.extend(0.5);
         let v = proj.velocity;
         transform.rotation = Quat::from_rotation_z(v.y.atan2(v.x));
+
+        // Leave a fading ember trail behind fast shots.
+        commands.spawn((
+            Particle {
+                velocity: -v * 0.05,
+                ttl: 0.18,
+                life: 0.18,
+                spin: 0.0,
+            },
+            Sprite::from_color(sprite_color(&proj), Vec2::splat(5.0)),
+            Transform::from_translation(pos.extend(0.4)),
+        ));
+    }
+}
+
+/// Trail color keyed off the projectile's role (returning blades cool down).
+fn sprite_color(proj: &Projectile) -> Color {
+    if proj.returning {
+        Color::linear_rgb(3.0, 3.0, 4.0)
+    } else if proj.slow {
+        Color::linear_rgb(2.0, 0.8, 5.0)
+    } else if proj.pierce {
+        Color::linear_rgb(1.8, 3.5, 5.5)
+    } else {
+        Color::linear_rgb(5.0, 3.2, 1.0)
     }
 }
 
@@ -465,10 +546,55 @@ fn spawn_enemies(
         Enemy {
             hp: 2,
             slow_left: 0.0,
+            flash: 0.0,
         },
+        // Rotated 45° so it reads as a diamond husk, not a box.
         Sprite::from_color(HUSK, Vec2::splat(HUSK_SIZE)),
-        Transform::from_translation(pos.extend(0.8)),
+        Transform::from_translation(pos.extend(0.8))
+            .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_4)),
     ));
+}
+
+/// Spray a short burst of fading debris from a point.
+fn spawn_burst(commands: &mut Commands, at: Vec2, color: Color, count: u32, spread: f32) {
+    let mut rng = rand::thread_rng();
+    for _ in 0..count {
+        let angle = rng.gen_range(0.0..std::f32::consts::TAU);
+        let speed = rng.gen_range(60.0..spread);
+        let life = rng.gen_range(0.25..0.6);
+        let size = rng.gen_range(3.0..7.0);
+        commands.spawn((
+            Particle {
+                velocity: Vec2::from_angle(angle) * speed,
+                ttl: life,
+                life,
+                spin: rng.gen_range(-12.0..12.0),
+            },
+            Sprite::from_color(color, Vec2::splat(size)),
+            Transform::from_translation(at.extend(0.6)),
+        ));
+    }
+}
+
+fn update_particles(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut particles: Query<(Entity, &mut Particle, &mut Transform, &mut Sprite)>,
+) {
+    let dt = time.delta_secs();
+    for (entity, mut p, mut tf, mut sprite) in &mut particles {
+        p.ttl -= dt;
+        if p.ttl <= 0.0 {
+            commands.entity(entity).despawn();
+            continue;
+        }
+        tf.translation += (p.velocity * dt).extend(0.0);
+        p.velocity *= 1.0 - 3.0 * dt; // drag
+        tf.rotate_z(p.spin * dt);
+        let k = (p.ttl / p.life).clamp(0.0, 1.0);
+        tf.scale = Vec3::splat(k.max(0.15));
+        sprite.color = sprite.color.with_alpha(k);
+    }
 }
 
 fn chase_player(
@@ -480,18 +606,25 @@ fn chase_player(
         return;
     };
     let target = player_tf.translation.truncate();
+    let dt = time.delta_secs();
     for (mut tf, mut enemy, mut sprite) in &mut enemies {
         let speed = if enemy.slow_left > 0.0 {
-            enemy.slow_left -= time.delta_secs();
-            sprite.color = Color::srgb(0.4, 0.35, 0.6); // chilled tint
+            enemy.slow_left -= dt;
+            sprite.color = Color::linear_rgb(0.8, 1.2, 4.0); // chilled tint
             HUSK_SPEED * 0.35
         } else {
             sprite.color = HUSK;
             HUSK_SPEED
         };
+        // White hit-flash briefly overrides the body color.
+        if enemy.flash > 0.0 {
+            enemy.flash -= dt;
+            sprite.color = Color::linear_rgb(8.0, 8.0, 9.0);
+        }
         let pos = tf.translation.truncate();
         let dir = (target - pos).normalize_or_zero();
-        tf.translation += (dir * speed * time.delta_secs()).extend(0.0);
+        tf.translation += (dir * speed * dt).extend(0.0);
+        tf.rotate_z(1.6 * dt); // slow spin
     }
 }
 
@@ -511,13 +644,18 @@ fn projectile_hits(
             let dist = proj_pos.distance(enemy_tf.translation.truncate());
             if dist < HUSK_SIZE * 0.5 + 7.0 {
                 enemy.hp -= proj.damage;
+                enemy.flash = 0.08;
+                let hit_at = enemy_tf.translation.truncate();
                 if proj.slow {
                     enemy.slow_left = 2.5;
                 }
                 if enemy.hp <= 0 {
                     commands.entity(enemy_entity).despawn();
                     stats.kills += 1;
+                    spawn_burst(&mut commands, hit_at, HUSK, 14, 260.0);
                     info!("husk down");
+                } else {
+                    spawn_burst(&mut commands, hit_at, GOLD, 4, 120.0);
                 }
                 if proj.pierce {
                     proj.already_hit.push(enemy_entity);
@@ -535,6 +673,7 @@ fn projectile_hits(
 }
 
 fn contact_damage(
+    mut commands: Commands,
     time: Res<Time>,
     mut next_phase: ResMut<NextState<Phase>>,
     mut player: Query<(&mut Player, &Transform, &mut Sprite)>,
@@ -549,7 +688,7 @@ fn contact_damage(
         sprite.color = if (player.invuln * 12.0) as i32 % 2 == 0 {
             CRIMSON
         } else {
-            Color::srgb(0.4, 0.05, 0.12)
+            Color::linear_rgb(0.6, 0.08, 0.2)
         };
         return;
     }
@@ -560,6 +699,7 @@ fn contact_damage(
         if pos.distance(enemy_tf.translation.truncate()) < HUSK_SIZE * 0.5 + 13.0 {
             player.hp -= 1;
             player.invuln = 1.0;
+            spawn_burst(&mut commands, pos, CRIMSON, 20, 320.0);
             info!("player hit, hp={}", player.hp);
             if player.hp <= 0 {
                 next_phase.set(Phase::GameOver);
@@ -613,7 +753,7 @@ fn restart(
     mut player: Query<(&mut Player, &mut Transform)>,
     cleanup: Query<
         Entity,
-        Or<(With<Enemy>, With<Projectile>, With<GameOverText>)>,
+        Or<(With<Enemy>, With<Projectile>, With<Particle>, With<GameOverText>)>,
     >,
 ) {
     if !keys.just_pressed(KeyCode::KeyR) {
