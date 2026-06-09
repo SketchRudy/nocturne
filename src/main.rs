@@ -198,10 +198,6 @@ struct StatsHud;
 #[derive(Component)]
 struct GameOverText;
 
-/// Spinning halo bars orbiting the player.
-#[derive(Component)]
-struct Halo;
-
 /// Arena border bars that breathe.
 #[derive(Component)]
 struct PulseBorder;
@@ -282,7 +278,7 @@ fn main() {
             )
                 .run_if(in_state(Phase::Playing)),
         )
-        .add_systems(Update, (spin_halo, pulse_border, apply_shake))
+        .add_systems(Update, (pulse_border, apply_shake))
         .add_systems(OnEnter(Phase::GameOver), show_game_over)
         .add_systems(Update, restart.run_if(in_state(Phase::GameOver)))
         .run();
@@ -332,32 +328,13 @@ fn setup(mut commands: Commands) {
         ));
     }
 
-    // Player: crimson diamond with a counter-spinning gold halo.
-    commands
-        .spawn((
-            Player { hp: 3, invuln: 0.0 },
-            Sprite::from_color(CRIMSON, Vec2::splat(26.0)),
-            Transform::from_xyz(0.0, 0.0, 1.0)
-                .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_4)),
-        ))
-        .with_children(|parent| {
-            parent
-                .spawn((Halo, Transform::default(), Visibility::default()))
-                .with_children(|halo| {
-                    let r = 26.0;
-                    for (size, pos) in [
-                        (Vec2::new(r * 1.4, 2.0), Vec2::new(0.0, r)),
-                        (Vec2::new(r * 1.4, 2.0), Vec2::new(0.0, -r)),
-                        (Vec2::new(2.0, r * 1.4), Vec2::new(r, 0.0)),
-                        (Vec2::new(2.0, r * 1.4), Vec2::new(-r, 0.0)),
-                    ] {
-                        halo.spawn((
-                            Sprite::from_color(GOLD.with_alpha(0.7), size),
-                            Transform::from_translation(pos.extend(-0.1)),
-                        ));
-                    }
-                });
-        });
+    // Player: crimson diamond.
+    commands.spawn((
+        Player { hp: 3, invuln: 0.0 },
+        Sprite::from_color(CRIMSON, Vec2::splat(26.0)),
+        Transform::from_xyz(0.0, 0.0, 1.0)
+            .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_4)),
+    ));
 
     commands.spawn((
         WeaponHud,
@@ -377,12 +354,6 @@ fn setup(mut commands: Commands) {
 }
 
 // ---------------------------------------------------------------- systems
-
-fn spin_halo(time: Res<Time>, mut halos: Query<&mut Transform, With<Halo>>) {
-    for mut tf in &mut halos {
-        tf.rotate_z(-1.1 * time.delta_secs());
-    }
-}
 
 fn pulse_border(time: Res<Time>, mut borders: Query<&mut Sprite, With<PulseBorder>>) {
     let breathe = 0.75 + 0.25 * (time.elapsed_secs() * 1.7).sin();
