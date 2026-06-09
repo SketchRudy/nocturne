@@ -169,7 +169,29 @@ impl Armory {
 // ---------------------------------------------------------------- components
 
 #[derive(Component)]
-struct Player;
+struct Player {
+    hp: i32,
+    invuln: f32,
+}
+
+#[derive(States, Clone, PartialEq, Eq, Hash, Debug, Default)]
+enum Phase {
+    #[default]
+    Playing,
+    GameOver,
+}
+
+#[derive(Resource, Default)]
+struct GameStats {
+    kills: u32,
+    elapsed: f32,
+}
+
+#[derive(Component)]
+struct StatsHud;
+
+#[derive(Component)]
+struct GameOverText;
 
 #[derive(Component)]
 struct Projectile {
@@ -214,6 +236,8 @@ fn main() {
         .insert_resource(FireCooldown(Timer::from_seconds(0.18, TimerMode::Once)))
         .insert_resource(EnemySpawner(Timer::from_seconds(1.4, TimerMode::Repeating)))
         .init_resource::<Armory>()
+        .init_resource::<GameStats>()
+        .init_state::<Phase>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -224,9 +248,13 @@ fn main() {
                 spawn_enemies,
                 chase_player,
                 projectile_hits,
+                contact_damage,
                 update_hud,
-            ),
+            )
+                .run_if(in_state(Phase::Playing)),
         )
+        .add_systems(OnEnter(Phase::GameOver), show_game_over)
+        .add_systems(Update, restart.run_if(in_state(Phase::GameOver)))
         .run();
 }
 
@@ -234,7 +262,7 @@ fn setup(mut commands: Commands) {
     commands.spawn(Camera2d);
 
     commands.spawn((
-        Player,
+        Player { hp: 3, invuln: 0.0 },
         Sprite::from_color(CRIMSON, Vec2::splat(26.0)),
         Transform::from_xyz(0.0, 0.0, 1.0),
     ));
@@ -245,6 +273,14 @@ fn setup(mut commands: Commands) {
         TextFont::from_font_size(22.0),
         TextColor(GOLD),
         Transform::from_xyz(0.0, ARENA_HALF.y + 18.0, 5.0),
+    ));
+
+    commands.spawn((
+        StatsHud,
+        Text2d::new("HP ### | KILLS 0"),
+        TextFont::from_font_size(20.0),
+        TextColor(CRIMSON),
+        Transform::from_xyz(-ARENA_HALF.x + 90.0, -ARENA_HALF.y - 18.0, 5.0),
     ));
 }
 
@@ -404,11 +440,20 @@ fn move_projectiles(
     }
 }
 
-fn spawn_enemies(mut commands: Commands, time: Res<Time>, mut spawner: ResMut<EnemySpawner>) {
+fn spawn_enemies(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut spawner: ResMut<EnemySpawner>,
+    mut stats: ResMut<GameStats>,
+) {
+    stats.elapsed += time.delta_secs();
     spawner.0.tick(time.delta());
     if !spawner.0.just_finished() {
         return;
     }
+    // Pressure ramps: spawn interval shrinks from 1.4s toward 0.45s over ~2 min.
+    let interval = (1.4 - stats.elapsed * 0.008).max(0.45);
+    spawner.0.set_duration(std::time::Duration::from_secs_f32(interval));
     let mut rng = rand::thread_rng();
     let pos = match rng.gen_range(0..4) {
         0 => Vec2::new(rng.gen_range(-ARENA_HALF.x..ARENA_HALF.x), ARENA_HALF.y),
@@ -452,6 +497,7 @@ fn chase_player(
 
 fn projectile_hits(
     mut commands: Commands,
+    mut stats: ResMut<GameStats>,
     mut projectiles: Query<(Entity, &Transform, &mut Projectile)>,
     mut enemies: Query<(Entity, &Transform, &mut Enemy)>,
 ) {
@@ -470,6 +516,7 @@ fn projectile_hits(
                 }
                 if enemy.hp <= 0 {
                     commands.entity(enemy_entity).despawn();
+                    stats.kills += 1;
                     info!("husk down");
                 }
                 if proj.pierce {
@@ -487,16 +534,101 @@ fn projectile_hits(
     }
 }
 
-fn update_hud(armory: Res<Armory>, mut hud: Query<&mut Text2d, With<WeaponHud>>) {
-    if !armory.is_changed() {
-        return;
-    }
-    let Ok(mut text) = hud.single_mut() else {
+fn contact_damage(
+    time: Res<Time>,
+    mut next_phase: ResMut<NextState<Phase>>,
+    mut player: Query<(&mut Player, &Transform, &mut Sprite)>,
+    enemies: Query<&Transform, With<Enemy>>,
+) {
+    let Ok((mut player, player_tf, mut sprite)) = player.single_mut() else {
         return;
     };
-    let mut line = format!("[{} {:02}]", armory.current().stats().name, armory.ammo);
-    for kind in armory.queue.iter().skip(1) {
-        line.push_str(&format!("  >  {}", kind.stats().name));
+    if player.invuln > 0.0 {
+        player.invuln -= time.delta_secs();
+        // Flicker while invulnerable
+        sprite.color = if (player.invuln * 12.0) as i32 % 2 == 0 {
+            CRIMSON
+        } else {
+            Color::srgb(0.4, 0.05, 0.12)
+        };
+        return;
     }
-    text.0 = line;
+    sprite.color = CRIMSON;
+
+    let pos = player_tf.translation.truncate();
+    for enemy_tf in &enemies {
+        if pos.distance(enemy_tf.translation.truncate()) < HUSK_SIZE * 0.5 + 13.0 {
+            player.hp -= 1;
+            player.invuln = 1.0;
+            info!("player hit, hp={}", player.hp);
+            if player.hp <= 0 {
+                next_phase.set(Phase::GameOver);
+            }
+            break;
+        }
+    }
+}
+
+fn update_hud(
+    armory: Res<Armory>,
+    stats: Res<GameStats>,
+    player: Query<&Player>,
+    mut weapon_hud: Query<&mut Text2d, (With<WeaponHud>, Without<StatsHud>)>,
+    mut stats_hud: Query<&mut Text2d, (With<StatsHud>, Without<WeaponHud>)>,
+) {
+    if let Ok(mut text) = weapon_hud.single_mut() {
+        let mut line = format!("[{} {:02}]", armory.current().stats().name, armory.ammo);
+        for kind in armory.queue.iter().skip(1) {
+            line.push_str(&format!("  >  {}", kind.stats().name));
+        }
+        text.0 = line;
+    }
+    if let (Ok(mut text), Ok(player)) = (stats_hud.single_mut(), player.single()) {
+        let hearts = "#".repeat(player.hp.max(0) as usize);
+        text.0 = format!("HP {:3} | KILLS {}", hearts, stats.kills);
+    }
+}
+
+fn show_game_over(mut commands: Commands, stats: Res<GameStats>) {
+    commands.spawn((
+        GameOverText,
+        Text2d::new(format!(
+            "ECLIPSED\n{} husks down in {:.0}s\npress R to rise again",
+            stats.kills, stats.elapsed
+        )),
+        TextFont::from_font_size(42.0),
+        TextColor(CRIMSON),
+        Transform::from_xyz(0.0, 60.0, 6.0),
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restart(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut next_phase: ResMut<NextState<Phase>>,
+    mut armory: ResMut<Armory>,
+    mut stats: ResMut<GameStats>,
+    mut spawner: ResMut<EnemySpawner>,
+    mut player: Query<(&mut Player, &mut Transform)>,
+    cleanup: Query<
+        Entity,
+        Or<(With<Enemy>, With<Projectile>, With<GameOverText>)>,
+    >,
+) {
+    if !keys.just_pressed(KeyCode::KeyR) {
+        return;
+    }
+    for entity in &cleanup {
+        commands.entity(entity).despawn();
+    }
+    *armory = Armory::default();
+    *stats = GameStats::default();
+    spawner.0 = Timer::from_seconds(1.4, TimerMode::Repeating);
+    if let Ok((mut player, mut tf)) = player.single_mut() {
+        player.hp = 3;
+        player.invuln = 1.0;
+        tf.translation = Vec3::new(0.0, 0.0, 1.0);
+    }
+    next_phase.set(Phase::Playing);
 }
